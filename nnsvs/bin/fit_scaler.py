@@ -1,4 +1,4 @@
-from os.path import exists
+# coding: utf-8
 
 import hydra
 import joblib
@@ -8,31 +8,22 @@ from nnsvs.logger import getLogger
 from omegaconf import DictConfig, OmegaConf
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
+logger = None
+
 
 @hydra.main(config_path="conf/fit_scaler", config_name="config")
 def my_app(config: DictConfig) -> None:
+    global logger
     logger = getLogger(config.verbose)
     logger.info(OmegaConf.to_yaml(config))
 
     list_path = to_absolute_path(config.list_path)
     out_path = to_absolute_path(config.out_path)
 
-    if config.external_scaler is not None:
-        scaler = joblib.load(config.external_scaler)
-    else:
-        scaler = hydra.utils.instantiate(config.scaler)
+    scaler = hydra.utils.instantiate(config.scaler)
     with open(list_path) as f:
         for path in f:
-            path = to_absolute_path(path.strip())
-            c = np.load(path)
-            if "out_acoustic/" in path:
-                assert "org" in path
-                in_path = path.replace("out_acoustic/", "in_acoustic/")
-                in_feats = np.load(in_path)
-                note_frame_indices = in_feats[:, config.in_rest_idx] <= 0
-                assert exists(in_path)
-                # Removed non-voice segments to compute statistics
-                c = c[note_frame_indices]
+            c = np.load(to_absolute_path(path.strip()))
             scaler.partial_fit(c)
         joblib.dump(scaler, out_path)
 

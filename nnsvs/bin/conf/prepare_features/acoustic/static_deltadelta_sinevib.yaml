@@ -18,10 +18,10 @@ mgc_order: 59
 
 # windows to compute delta and delta-delta features
 # set 1 to disable
-num_windows: 1
+num_windows: 3
 
 # Use relative f0 modeling.
-relative_f0: true
+relative_f0: false
 
 interp_unvoiced_aperiodicity: true
 
@@ -37,4 +37,4 @@ interp_unvoiced_aperiodicity: true
 # NOTE: you must be careful about the dimension of the acoustic features.
 # For example, if you use sine-based vibrato modeling (w/ dynamic features),
 # you'd need to increase 2*num_windows + 1 for the `out_dim` of the acoustic model.
-vibrato_mode: none
+vibrato_mode: sine

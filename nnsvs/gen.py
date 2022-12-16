@@ -5,17 +5,26 @@ import pyworld
 import torch
 from nnmnkwii.frontend import merlin as fe
 from nnmnkwii.io import hts
+from nnmnkwii.postfilters import merlin_post_filter
 from nnmnkwii.preprocessing.f0 import interp1d
 from nnsvs.base import PredictionType
 from nnsvs.io.hts import get_note_indices
-from nnsvs.multistream import (
-    get_static_stream_sizes,
-    get_windows,
-    multi_stream_mlpg,
-    split_streams,
-)
+from nnsvs.multistream import get_static_stream_sizes, multi_stream_mlpg, split_streams
 from nnsvs.pitch import gen_sine_vibrato
 from sklearn.preprocessing import MinMaxScaler
+
+
+def get_windows(num_window=1):
+    windows = [(0, 0, np.array([1.0]))]
+    if num_window >= 2:
+        windows.append((1, 1, np.array([-0.5, 0.0, 0.5])))
+    if num_window >= 3:
+        windows.append((1, 1, np.array([1.0, -2.0, 1.0])))
+
+    if num_window >= 4:
+        raise ValueError(f"Not supported num windows: {num_window}")
+
+    return windows
 
 
 def _midi_to_hz(x, idx, log_f0=False):
@@ -50,32 +59,7 @@ def predict_timelag(
     allowed_range=None,
     allowed_range_rest=None,
     force_clip_input_features=False,
-    frame_period=5,
 ):
-    """Predict time-lag from HTS labels
-
-    Args:
-        device (torch.device): device
-        labels (nnmnkwii.io.hts.HTSLabelFile): HTS-style labels
-        timelag_model (nn.Module): time-lag model
-        timelag_config (dict): time-lag model config
-        timelag_in_scaler (sklearn.preprocessing.MinMaxScaler): input scaler
-        timelag_out_scaler (sklearn.preprocessing.MinMaxScaler): output scaler
-        binary_dict (dict): binary feature dict
-        numeric_dict (dict): numeric feature dict
-        pitch_indices (list): indices of pitch features
-        log_f0_conditioning (bool): whether to condition on log f0
-        allowed_range (list): allowed range of time-lag
-        allowed_range_rest (list): allowed range of time-lag for rest
-        force_clip_input_features (bool): whether to clip input features
-
-    Returns;
-        ndarray: time-lag predictions
-    """
-    hts_frame_shift = int(frame_period * 1e4)
-    # make sure to set frame shift properly before calling round_ method
-    labels.frame_shift = hts_frame_shift
-
     if allowed_range is None:
         allowed_range = [-20, 20]
     if allowed_range_rest is None:
@@ -94,7 +78,6 @@ def predict_timelag(
         numeric_dict,
         add_frame_features=False,
         subphone_features=None,
-        frame_shift=hts_frame_shift,
     ).astype(np.float32)
 
     # Adjust input features if we use log-f0 conditioning
@@ -137,7 +120,6 @@ def predict_timelag(
             max_sigma_sq = (
                 max_sigma.squeeze(0).cpu().data.numpy() ** 2 * timelag_out_scaler.var_
             )
-            max_sigma_sq = np.maximum(max_sigma_sq, 1e-14)
             max_mu = timelag_out_scaler.inverse_transform(
                 max_mu.squeeze(0).cpu().data.numpy()
             )
@@ -186,7 +168,7 @@ def predict_timelag(
             )
 
     # frames -> 100 ns
-    pred_timelag *= hts_frame_shift
+    pred_timelag *= 50000
 
     return pred_timelag
 
@@ -203,28 +185,7 @@ def predict_duration(
     pitch_indices=None,
     log_f0_conditioning=True,
     force_clip_input_features=False,
-    frame_period=5,
 ):
-    """Predict phoneme durations from HTS labels
-
-    Args:
-        device (torch.device): device to run the model on
-        labels (nnmnkwii.io.hts.HTSLabelFile): labels
-        duration_model (nn.Module): duration model
-        duration_config (dict): duration config
-        duration_in_scaler (sklearn.preprocessing.MinMaxScaler): duration input scaler
-        duration_out_scaler (sklearn.preprocessing.MinMaxScaler): duration output scaler
-        binary_dict (dict): binary feature dictionary
-        numeric_dict (dict): numeric feature dictionary
-        pitch_indices (list): indices of pitch features
-        log_f0_conditioning (bool): whether to use log-f0 conditioning
-        force_clip_input_features (bool): whether to clip input features
-
-    Returns:
-        np.ndarray: predicted durations
-    """
-    hts_frame_shift = int(frame_period * 1e4)
-
     # Extract musical/linguistic features
     duration_linguistic_features = fe.linguistic_features(
         labels,
@@ -232,7 +193,6 @@ def predict_duration(
         numeric_dict,
         add_frame_features=False,
         subphone_features=None,
-        frame_shift=hts_frame_shift,
     ).astype(np.float32)
 
     if log_f0_conditioning:
@@ -274,7 +234,6 @@ def predict_duration(
         max_sigma_sq = (
             max_sigma.squeeze(0).cpu().data.numpy() ** 2 * duration_out_scaler.var_
         )
-        max_sigma_sq = np.maximum(max_sigma_sq, 1e-14)
         max_mu = duration_out_scaler.inverse_transform(
             max_mu.squeeze(0).cpu().data.numpy()
         )
@@ -303,7 +262,7 @@ def predict_duration(
     return pred_durations
 
 
-def postprocess_duration(labels, pred_durations, lag, frame_period=5):
+def postprocess_duration(labels, pred_durations, lag):
     """Post-process durations based on predicted time-lag
 
     Ref : https://arxiv.org/abs/2108.02776
@@ -317,8 +276,6 @@ def postprocess_duration(labels, pred_durations, lag, frame_period=5):
     Returns:
         HTSLabelFile: labels with adjusted durations
     """
-    hts_frame_shift = int(frame_period * 1e4)
-
     note_indices = get_note_indices(labels)
     # append the end of note
     note_indices.append(len(labels))
@@ -334,22 +291,19 @@ def postprocess_duration(labels, pred_durations, lag, frame_period=5):
         # eq (11)
         L = int(fe.duration_features(p)[0])
         if i < len(note_indices) - 1:
-            L_hat = L - (lag[i - 1] - lag[i]) / hts_frame_shift
+            L_hat = L - (lag[i - 1] - lag[i]) / 50000
         else:
-            L_hat = L - (lag[i - 1]) / hts_frame_shift
-
-        # Prevent negative duration
-        L_hat = max(L_hat, 1)
+            L_hat = L - (lag[i - 1]) / 50000
 
         # adjust the start time of the note
         p.start_times = np.minimum(
             np.asarray(p.start_times) + lag[i - 1].reshape(-1),
-            np.asarray(p.end_times) - hts_frame_shift * len(p),
+            np.asarray(p.end_times) - 50000 * len(p),
         )
         p.start_times = np.maximum(p.start_times, 0)
         if len(output_labels) > 0:
             p.start_times = np.maximum(
-                p.start_times, output_labels.start_times[-1] + hts_frame_shift
+                p.start_times, output_labels.start_times[-1] + 50000
             )
 
         # Compute normalized phoneme durations
@@ -363,11 +317,10 @@ def postprocess_duration(labels, pred_durations, lag, frame_period=5):
 
             if np.any(d_norm <= 0):
                 # eq (12) (using mu as d_hat)
-                s = frame_period * 0.001
                 print(
                     f"Negative phoneme durations are predicted at {i}-th note. "
                     "The note duration: ",
-                    f"{round(float(L)*s,3)} sec -> {round(float(L_hat)*s,3)} sec",
+                    f"{round(float(L)*0.005,3)} sec -> {round(float(L_hat)*0.005,3)} sec",
                 )
                 print(
                     "It's likely that the model couldn't predict correct durations "
@@ -411,32 +364,7 @@ def predict_acoustic(
     pitch_indices=None,
     log_f0_conditioning=True,
     force_clip_input_features=False,
-    frame_period=5,
-    f0_shift_in_cent=0,
 ):
-    """Predict acoustic features from HTS labels
-
-    MLPG is applied to the predicted features if the output features have
-    dynamic features.
-
-    Args:
-        device (torch.device): device to use
-        labels (HTSLabelFile): HTS labels
-        acoustic_model (nn.Module): acoustic model
-        acoustic_config (AcousticConfig): acoustic configuration
-        acoustic_in_scaler (sklearn.preprocessing.StandardScaler): input scaler
-        acoustic_out_scaler (sklearn.preprocessing.StandardScaler): output scaler
-        binary_dict (dict): binary feature dictionary
-        numeric_dict (dict): numeric feature dictionary
-        subphone_features (str): subphone feature type
-        pitch_indices (list): indices of pitch features
-        log_f0_conditioning (bool): whether to use log f0 conditioning
-        force_clip_input_features (bool): whether to force clip input features
-
-    Returns:
-        ndarray: predicted acoustic features
-    """
-    hts_frame_shift = int(frame_period * 1e4)
 
     # Musical/linguistic features
     linguistic_features = fe.linguistic_features(
@@ -445,7 +373,6 @@ def predict_acoustic(
         numeric_dict,
         add_frame_features=True,
         subphone_features=subphone_features,
-        frame_shift=hts_frame_shift,
     )
 
     if log_f0_conditioning:
@@ -454,9 +381,6 @@ def predict_acoustic(
                 _midi_to_hz(linguistic_features, idx, log_f0_conditioning),
                 kind="slinear",
             )
-            if f0_shift_in_cent != 0:
-                lf0_offset = f0_shift_in_cent * np.log(2) / 1200
-                linguistic_features[:, idx] += lf0_offset
 
     # Apply normalization
     linguistic_features = acoustic_in_scaler.transform(linguistic_features)
@@ -477,10 +401,7 @@ def predict_acoustic(
     x = torch.from_numpy(linguistic_features).float().to(device)
     x = x.view(1, -1, x.size(-1))
 
-    if acoustic_model.prediction_type() in [
-        PredictionType.PROBABILISTIC,
-        PredictionType.MULTISTREAM_HYBRID,
-    ]:
+    if acoustic_model.prediction_type() == PredictionType.PROBABILISTIC:
         # (B, T, D_out)
         max_mu, max_sigma = acoustic_model.inference(x, [x.shape[1]])
         if np.any(acoustic_config.has_dynamic_features):
@@ -527,63 +448,7 @@ def predict_acoustic(
     return pred_acoustic
 
 
-def correct_vuv_by_phone(vuv, binary_dict, linguistic_features):
-    """Correct V/UV by phone-related flags in a hed file
-
-    This function allows us to control V/UV explicitly by ``C-VUV_Voiced``
-    and ``C-VUV_Unvoied`` flags in a hed file. This is useful when you see
-    your trained acoustic model have lots of V/UV errors.
-    Note that manually controlling V/UV means we are ignoring the
-    acoustic model's prediction. It would have negative impact in some
-    cases, but most cases it would help workaround V/UV errors.
-
-    Args:
-        vuv (ndarray): V/UV flags
-        binary_dict (dict): binary feature dictionary
-        linguistic_features (ndarray): linguistic features
-
-    Returns:
-        ndarray: corrected V/UV flags
-    """
-    vuv = vuv.copy()
-
-    # Set V/UV to 1 based on the C-VUV_Voiced flag
-    in_voiced_idx = -1
-    for k, v in binary_dict.items():
-        name, _ = v
-        if "C-VUV_Voiced" in name:
-            in_voiced_idx = k
-            break
-    if in_voiced_idx > 0:
-        indices = linguistic_features[:, in_voiced_idx : in_voiced_idx + 1] > 0
-        vuv[indices] = 1.0
-
-    # Set V/UV to 0 based on the C-VUV_Unvoiced flag
-    in_unvoiced_indices = []
-    for k, v in binary_dict.items():
-        name, _ = v
-        if "C-VUV_Unvoiced" in name:
-            in_unvoiced_indices.append(k)
-    if len(in_unvoiced_indices) > 0:
-        for in_unvoiced_idx in in_unvoiced_indices:
-            indices = linguistic_features[:, in_unvoiced_idx : in_unvoiced_idx + 1] > 0
-            vuv[indices] = 0.0
-
-    # Set V/UV to 0 for sil/pau/br
-    in_sil_indices = []
-    for k, v in binary_dict.items():
-        name, _ = v
-        if "C-Phone_sil" in name or "C-Phone_pau" in name or "C-Phone_br" in name:
-            in_sil_indices.append(k)
-    if len(in_sil_indices) > 0:
-        for in_sil_idx in in_sil_indices:
-            indices = linguistic_features[:, in_sil_idx : in_sil_idx + 1] > 0
-            vuv[indices] = 0.0
-
-    return vuv
-
-
-def gen_spsvs_static_features(
+def gen_world_params(
     labels,
     acoustic_features,
     binary_dict,
@@ -593,35 +458,14 @@ def gen_spsvs_static_features(
     subphone_features="coarse_coding",
     pitch_idx=None,
     num_windows=3,
+    post_filter=True,
+    sample_rate=48000,
     frame_period=5,
     relative_f0=True,
     vibrato_scale=1.0,
     vuv_threshold=0.3,
-    force_fix_vuv=True,
 ):
-    """Generate static features from predicted acoustic features
-
-    Args:
-        labels (HTSLabelFile): HTS labels
-        acoustic_features (ndarray): predicted acoustic features
-        binary_dict (dict): binary feature dictionary
-        numeric_dict (dict): numeric feature dictionary
-        stream_sizes (list): stream sizes
-        has_dynamic_features (list): whether each stream has dynamic features
-        subphone_features (str): subphone feature type
-        pitch_idx (int): index of pitch features
-        num_windows (int): number of windows
-        frame_period (float): frame period
-        relative_f0 (bool): whether to use relative f0
-        vibrato_scale (float): vibrato scale
-        vuv_threshold (float): vuv threshold
-        force_fix_vuv (bool): whether to use post-processing to fix VUV.
-
-    Returns:
-        tuple: tuple of mgc, lf0, vuv and bap.
-    """
-    hts_frame_shift = int(frame_period * 1e4)
-
+    # Apply MLPG if necessary
     if np.any(has_dynamic_features):
         static_stream_sizes = get_static_stream_sizes(
             stream_sizes, has_dynamic_features, num_windows
@@ -629,12 +473,8 @@ def gen_spsvs_static_features(
     else:
         static_stream_sizes = stream_sizes
 
-    # Copy here to avoid inplace operations on input acoustic features
-    acoustic_features = acoustic_features.copy()
-
     # Split multi-stream features
     streams = split_streams(acoustic_features, static_stream_sizes)
-
     if len(streams) == 4:
         mgc, target_f0, vuv, bap = streams
         vib, vib_flags = None, None
@@ -648,22 +488,34 @@ def gen_spsvs_static_features(
     else:
         raise RuntimeError("Not supported streams")
 
-    linguistic_features = fe.linguistic_features(
-        labels,
-        binary_dict,
-        numeric_dict,
-        add_frame_features=True,
-        subphone_features=subphone_features,
-        frame_shift=hts_frame_shift,
+    # Gen waveform by the WORLD vocodoer
+    fftlen = pyworld.get_cheaptrick_fft_size(sample_rate)
+    alpha = pysptk.util.mcepalpha(sample_rate)
+
+    if post_filter:
+        mgc = merlin_post_filter(mgc, alpha)
+
+    spectrogram = pysptk.mc2sp(mgc, fftlen=fftlen, alpha=alpha)
+    aperiodicity = pyworld.decode_aperiodicity(
+        bap.astype(np.float64), sample_rate, fftlen
     )
 
-    # Correct V/UV based on special phone flags
-    if force_fix_vuv:
-        vuv = correct_vuv_by_phone(vuv, binary_dict, linguistic_features)
+    # fill aperiodicity with ones for unvoiced regions
+    aperiodicity[vuv.reshape(-1) < vuv_threshold, :] = 1.0
+    # WORLD fails catastrophically for out of range aperiodicity
+    aperiodicity = np.clip(aperiodicity, 0.0, 1.0)
 
     # F0
     if relative_f0:
         diff_lf0 = target_f0
+        # need to extract pitch sequence from the musical score
+        linguistic_features = fe.linguistic_features(
+            labels,
+            binary_dict,
+            numeric_dict,
+            add_frame_features=True,
+            subphone_features=subphone_features,
+        )
         f0_score = _midi_to_hz(linguistic_features, pitch_idx, False)[:, None]
         lf0_score = f0_score.copy()
         nonzero_indices = np.nonzero(lf0_score)
@@ -694,72 +546,6 @@ def gen_spsvs_static_features(
         else:
             # Generate diff-based vibrato
             f0 = f0.flatten() + vibrato_scale * vib.flatten()
-
-    # NOTE: Back to log-domain for convenience
-    lf0 = f0.copy()
-    lf0[np.nonzero(lf0)] = np.log(f0[np.nonzero(lf0)])
-    # NOTE: interpolation is necessary
-    lf0 = interp1d(lf0, kind="slinear")
-
-    lf0 = lf0[:, None] if len(lf0.shape) == 1 else lf0
-    vuv = vuv[:, None] if len(vuv.shape) == 1 else vuv
-
-    return mgc, lf0, vuv, bap
-
-
-def gen_world_params(
-    mgc,
-    lf0,
-    vuv,
-    bap,
-    sample_rate,
-    vuv_threshold=0.3,
-    use_world_codec=False,
-):
-    """Generate WORLD parameters from mgc, lf0, vuv and bap.
-
-    Args:
-        mgc (ndarray): mgc
-        lf0 (ndarray): lf0
-        vuv (ndarray): vuv
-        bap (ndarray): bap
-        sample_rate (int): sample rate
-        vuv_threshold (float): threshold for VUV
-        use_world_codec (bool): whether to use WORLD codec for spectral envelope
-
-    Returns:
-        tuple: tuple of f0, spectrogram and aperiodicity
-    """
-    fftlen = pyworld.get_cheaptrick_fft_size(sample_rate)
-    alpha = pysptk.util.mcepalpha(sample_rate)
-    use_mcep_aperiodicity = bap.shape[-1] > 5
-
-    if use_world_codec:
-        spectrogram = pyworld.decode_spectral_envelope(
-            np.ascontiguousarray(mgc).astype(np.float64), sample_rate, fftlen
-        )
-    else:
-        spectrogram = pysptk.mc2sp(
-            np.ascontiguousarray(mgc), fftlen=fftlen, alpha=alpha
-        )
-
-    if use_mcep_aperiodicity:
-        aperiodicity = pysptk.mc2sp(
-            np.ascontiguousarray(bap), fftlen=fftlen, alpha=alpha
-        )
-    else:
-        aperiodicity = pyworld.decode_aperiodicity(
-            np.ascontiguousarray(bap).astype(np.float64), sample_rate, fftlen
-        )
-
-    # fill aperiodicity with ones for unvoiced regions
-    aperiodicity[vuv.reshape(-1) < vuv_threshold, 0] = 1.0
-    # WORLD fails catastrophically for out of range aperiodicity
-    aperiodicity = np.clip(aperiodicity, 0.0, 1.0)
-
-    f0 = lf0.copy()
-    f0[np.nonzero(f0)] = np.exp(f0[np.nonzero(f0)])
-    f0[vuv < vuv_threshold] = 0
 
     f0 = f0.flatten().astype(np.float64)
     spectrogram = spectrogram.astype(np.float64)
